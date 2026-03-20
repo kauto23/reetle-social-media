@@ -5,4 +5,4 @@ asyncpg
 google-cloud-storage
 google-cloud-logging
 google-cloud-secret-manager
-reetle-models @ git+https://github.com/kauto23/reetle-models.git@v1.0.1
+reetle-models @ git+https://github.com/kauto23/reetle-models.git@main
