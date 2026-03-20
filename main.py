@@ -58,12 +58,17 @@ def _fetch_secret(secret_id: str) -> str:
 
 
 def load_secrets():
-    # Database URL always from Secret Manager (never from env).
+    # Secret Manager (project lect-io) — confirm these exact resource names exist:
+    #   - DATABASE_URL_PRODUCTION     (always, all environments)
+    #   - FACEBOOK_PAGE_ID             (cloud only)
+    #   - FACEBOOK_PAGE_ACCESS_TOKEN  (cloud only)
+    #   - INTERNAL_API_KEY            (cloud only)
     database_url = _fetch_secret("DATABASE_URL_PRODUCTION")
 
     if env == "cloud":
-        fb_page_id = _fetch_secret("facebook-page-id")
-        fb_access_token = _fetch_secret("facebook-page-access-token")
+        # Secret Manager IDs must match names in GCP (SCREAMING_SNAKE_CASE).
+        fb_page_id = _fetch_secret("FACEBOOK_PAGE_ID")
+        fb_access_token = _fetch_secret("FACEBOOK_PAGE_ACCESS_TOKEN")
         reetle_api_key = _fetch_secret("INTERNAL_API_KEY")
         logger.info("Loaded secrets from Google Secret Manager")
     else:
