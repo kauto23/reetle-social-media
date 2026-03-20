@@ -328,6 +328,35 @@ def ensure_article_content(article_id: int) -> None:
     )
 
 
+def prescrape_share_url(share_url: str) -> None:
+    """Warm up the share URL and force Facebook to cache the OG data before posting."""
+    section("Facebook — pre-scrape OG data")
+
+    logger.info("Warming up share URL: GET %s", share_url)
+    warm_resp = requests.get(share_url, timeout=15)
+    logger.info("Share URL HTTP %s (%d bytes)", warm_resp.status_code, len(warm_resp.content))
+
+    access_token = secrets["facebook_access_token"]
+    logger.info("Forcing Facebook scrape: POST graph.facebook.com/?id=...&scrape=true")
+    scrape_resp = requests.post(
+        f"{GRAPH_API_BASE}/",
+        data={
+            "id": share_url,
+            "scrape": "true",
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    logger.info("Scrape response HTTP %s", scrape_resp.status_code)
+
+    try:
+        scrape_data = scrape_resp.json()
+        og_title = scrape_data.get("title", "(missing)")
+        logger.info("Facebook cached og:title = %s", og_title[:120])
+    except Exception:
+        logger.warning("Could not parse scrape response: %s", scrape_resp.text[:300])
+
+
 def publish_link_to_facebook(share_url: str, caption: str) -> str:
     """Publish a link post to the Facebook Page. Returns the post ID."""
     section("Facebook — publish link post")
@@ -444,6 +473,7 @@ async def run():
     logger.info("Share URL: %s", share_url)
 
     ensure_article_content(article_id)
+    prescrape_share_url(share_url)
     caption = build_caption()
     post_id = publish_link_to_facebook(share_url, caption)
 
