@@ -11,23 +11,13 @@ import requests
 
 env = os.getenv('ENVIRONMENT', 'local')
 
-if env == 'cloud':
-    import google.cloud.logging
-
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
-    log_client = google.cloud.logging.Client()
-    log_client.setup_logging(log_level=logging.INFO)
-
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        if isinstance(handler, logging.StreamHandler):
-            root_logger.removeHandler(handler)
-else:
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(message)s',
-        handlers=[logging.StreamHandler()],
-    )
+# Cloud Run ingests stdout/stderr into Cloud Logging. The google-cloud-logging
+# client batches asynchronously; Jobs often exit before it flushes, so logs vanish.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler()],
+)
 
 logger = logging.getLogger(__name__)
 
