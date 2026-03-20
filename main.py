@@ -30,28 +30,47 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Secret Manager project (no env var — fixed for this app).
+GCP_PROJECT_ID = "lect-io"
+
+# Production LectIO API — no env var; single known endpoint.
+REETLE_API_BASE_URL = (
+    "https://reetle-api-production-507485624349.us-central1.run.app/api"
+)
+
+
+def _fetch_secret(secret_id: str) -> str:
+    """Load a secret from Google Secret Manager; unknown ID or empty value raises."""
+    from google.cloud import secretmanager
+
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{GCP_PROJECT_ID}/secrets/{secret_id}/versions/latest"
+    try:
+        response = client.access_secret_version(request={"name": name})
+    except Exception as exc:  # noqa: BLE001 — surface as configuration error
+        raise RuntimeError(
+            f"Could not load secret {secret_id!r} from project {GCP_PROJECT_ID}"
+        ) from exc
+    value = response.payload.data.decode("UTF-8").strip()
+    if not value:
+        raise ValueError(f"Secret {secret_id!r} is empty")
+    return value
+
 
 def load_secrets():
-    if env == 'cloud':
-        from google.cloud import secretmanager
+    # Database URL always from Secret Manager (never from env).
+    database_url = _fetch_secret("DATABASE_URL_PRODUCTION")
 
-        client = secretmanager.SecretManagerServiceClient()
-        project_id = os.getenv('GCP_PROJECT_ID', 'lect-io')
-
-        def get_secret(secret_id):
-            name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
-            response = client.access_secret_version(request={"name": name})
-            return response.payload.data.decode('UTF-8')
-
-        fb_page_id = get_secret('facebook-page-id')
-        fb_access_token = get_secret('facebook-page-access-token')
-        reetle_api_key = get_secret('INTERNAL_API_KEY')
+    if env == "cloud":
+        fb_page_id = _fetch_secret("facebook-page-id")
+        fb_access_token = _fetch_secret("facebook-page-access-token")
+        reetle_api_key = _fetch_secret("INTERNAL_API_KEY")
         logger.info("Loaded secrets from Google Secret Manager")
     else:
         load_dotenv()
-        fb_page_id = os.getenv('FACEBOOK_PAGE_ID')
-        fb_access_token = os.getenv('FACEBOOK_PAGE_ACCESS_TOKEN')
-        reetle_api_key = os.getenv('INTERNAL_API_KEY')
+        fb_page_id = os.getenv("FACEBOOK_PAGE_ID")
+        fb_access_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+        reetle_api_key = os.getenv("INTERNAL_API_KEY")
 
         if not all([fb_page_id, fb_access_token, reetle_api_key]):
             raise ValueError(
@@ -59,18 +78,22 @@ def load_secrets():
                 "or INTERNAL_API_KEY in .env"
             )
 
-        logger.info("Loaded secrets from .env file")
+        logger.info(
+            "Loaded Facebook / internal API from .env; "
+            "database URL from Secret Manager (DATABASE_URL_PRODUCTION)"
+        )
 
     return {
         'facebook_page_id': fb_page_id,
         'facebook_access_token': fb_access_token,
         'reetle_internal_api_key': reetle_api_key,
+        'database_url': database_url,
     }
 
 
 secrets = load_secrets()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = secrets['database_url']
 
 TORTOISE_ORM = {
     "connections": {"default": DATABASE_URL},
@@ -85,10 +108,6 @@ TORTOISE_ORM = {
 GRAPH_API_BASE = "https://graph.facebook.com/v22.0"
 SHARE_URL_TEMPLATE = "https://reetle.co/share?article={article_id}"
 
-REETLE_API_BASE_URL = os.getenv(
-    "REETLE_API_BASE_URL",
-    "https://reetle-api-production-507485624349.us-central1.run.app/api",
-)
 CONTENT_CEFR_LEVEL = "A2"
 CONTENT_TARGET_LANGUAGE = "es"
 

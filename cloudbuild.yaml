@@ -1,11 +1,14 @@
-# cloudbuild.yaml — reetle-facebook-poster
+# cloudbuild.yaml — reetle-social-media
+# Same build identity as reetle-push-notifications-trigger (Artifact Registry, Run jobs, GSM build secrets).
+serviceAccount: projects/lect-io/serviceAccounts/push-notification-service@lect-io.iam.gserviceaccount.com
+
 substitutions:
   _PROJECT_ID: lect-io
   _REGION: us-central1
   _AR_HOST: us-docker.pkg.dev
   _AR_REPO: lect-io-containers
-  _IMAGE_NAME: reetle-facebook-poster
-  _SERVICE: reetle-facebook-poster
+  _IMAGE_NAME: reetle-social-media
+  _SERVICE: reetle-social-media
 
 options:
   logging: CLOUD_LOGGING_ONLY
