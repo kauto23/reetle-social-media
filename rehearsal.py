@@ -1,8 +1,8 @@
 """
 rehearsal.py — Full dress rehearsal for the Reetle Facebook posting pipeline.
 
-Mirrors production logic exactly: reads the database, selects an article using
-the same query, builds a share URL, posts a link post to Facebook, and records
+Mirrors production logic exactly: reads the database, selects an article,
+builds the article URL, posts a link post to Facebook, and records
 the post in the database — all with detailed logging so every step is unambiguous.
 
 Usage:
@@ -59,7 +59,7 @@ def warn(msg: str):
 # ---------------------------------------------------------------------------
 
 GRAPH_API_BASE = "https://graph.facebook.com/v22.0"
-SHARE_URL_TEMPLATE = "https://reetle.co/share?article={article_id}"
+ARTICLE_URL_TEMPLATE = "https://reetle.co/?article={article_id}"
 
 REETLE_API_BASE_URL = None  # filled in after env is loaded
 CONTENT_CEFR_LEVEL = "A2"
@@ -314,23 +314,53 @@ async def select_article() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Verify share URL is reachable
+# Step 4 — Verify article URL is reachable
 # ---------------------------------------------------------------------------
 
-def verify_share_url(share_url: str) -> None:
-    section("Step 4 — Verify OG share URL is reachable")
+def verify_article_url(article_url: str, access_token: str) -> None:
+    section("Step 4 — Verify OG article URL & Facebook scrape")
 
-    info(f"Share URL : {share_url}")
-    logger.info("        Sending HEAD request…")
+    info(f"Article URL : {article_url}")
 
-    response = requests.head(share_url, timeout=10, allow_redirects=False)
-    info(f"HTTP status : {response.status_code}")
+    info("")
+    info("── 4a: GET article URL ──")
+    get_resp = requests.get(article_url, timeout=15)
+    info(f"HTTP status  : {get_resp.status_code}")
+    info(f"Content-Type : {get_resp.headers.get('Content-Type', '(missing)')}")
+    info(f"Body length  : {len(get_resp.text)} chars")
 
-    if response.status_code == 200:
-        ok("Share URL is reachable and returned 200 OK")
+    has_og_title = 'og:title' in get_resp.text
+    has_og_image = 'og:image' in get_resp.text
+    if has_og_title and has_og_image:
+        ok("HTML contains og:title and og:image")
     else:
-        warn(f"Unexpected status {response.status_code} — Facebook scraper may fail to fetch OG tags")
-        info("Continuing anyway — this may still work if the API is behind a proxy")
+        warn(f"og:title present={has_og_title}, og:image present={has_og_image}")
+
+    # 4c — Force Facebook to scrape the URL and log what it caches
+    info("")
+    info("── 4c: Force Facebook scrape (what does Facebook see?) ──")
+    scrape_resp = requests.post(
+        "https://graph.facebook.com/v22.0/",
+        data={
+            "id": article_url,
+            "scrape": "true",
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    info(f"Scrape HTTP status : {scrape_resp.status_code}")
+    info(f"Scrape response    :")
+    try:
+        scrape_data = scrape_resp.json()
+        for k, v in scrape_data.items():
+            info(f"  {k} = {v}")
+        og_title = scrape_data.get("title")
+        if og_title:
+            ok(f"Facebook cached og:title = {og_title[:120]}")
+        else:
+            warn("Facebook returned NO og:title — the post card will be blank")
+    except Exception:
+        warn(f"Could not parse scrape response: {scrape_resp.text[:400]}")
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +458,7 @@ def build_caption() -> str:
 # ---------------------------------------------------------------------------
 
 def publish_to_facebook(
-    share_url: str,
+    article_url: str,
     caption: str,
     page_id: str,
     access_token: str,
@@ -439,14 +469,14 @@ def publish_to_facebook(
     info(f"Endpoint  : POST {url}")
     info(f"Page ID   : {page_id}")
     info(f"message   : {caption}")
-    info(f"link      : {share_url}")
+    info(f"link      : {article_url}")
     logger.info("        Sending request to Facebook Graph API…")
 
     response = requests.post(
         url,
         data={
             "message": caption,
-            "link": share_url,
+            "link": article_url,
             "access_token": access_token,
         },
         timeout=60,
@@ -539,16 +569,16 @@ async def run(cfg: dict):
         info("This is the same outcome the live scheduler would produce right now.")
         return
 
-    share_url = SHARE_URL_TEMPLATE.format(article_id=article["article_id"])
+    article_url = ARTICLE_URL_TEMPLATE.format(article_id=article["article_id"])
 
-    verify_share_url(share_url)
+    verify_article_url(article_url, cfg["facebook_access_token"])
 
     ensure_article_content(article["article_id"], cfg["reetle_internal_api_key"])
 
     caption = build_caption()
 
     post_id = publish_to_facebook(
-        share_url=share_url,
+        article_url=article_url,
         caption=caption,
         page_id=cfg["facebook_page_id"],
         access_token=cfg["facebook_access_token"],
