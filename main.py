@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import logging
 import random
 from datetime import datetime, timezone
@@ -29,6 +30,27 @@ else:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def section(title: str) -> None:
+    """Visible step boundary in Cloud Logging (lighter than rehearsal.py)."""
+    bar = "=" * 64
+    logger.info(bar)
+    logger.info("%s", title)
+    logger.info(bar)
+
+
+def _mask_database_url(url: str) -> str:
+    if not url:
+        return "(empty)"
+    return re.sub(r"(?<=://)([^:]+):([^@]+)@", r"\1:***@", url)
+
+
+def _redact_token(value: str, head: int = 8, tail: int = 4) -> str:
+    if not value or len(value) <= head + tail + 3:
+        return "(set)"
+    return f"{value[:head]}...{value[-tail:]}"
+
 
 # Secret Manager project (no env var — fixed for this app).
 GCP_PROJECT_ID = "lect-io"
@@ -70,7 +92,13 @@ def load_secrets():
         fb_page_id = _fetch_secret("FACEBOOK_PAGE_ID")
         fb_access_token = _fetch_secret("FACEBOOK_PAGE_ACCESS_TOKEN")
         reetle_api_key = _fetch_secret("INTERNAL_API_KEY")
-        logger.info("Loaded secrets from Google Secret Manager")
+        section("Startup — credentials (cloud)")
+        logger.info("ENVIRONMENT=cloud | secrets=Secret Manager")
+        logger.info("DATABASE_URL (masked)=%s", _mask_database_url(database_url))
+        logger.info("FACEBOOK_PAGE_ID=%s", fb_page_id)
+        logger.info("INTERNAL_API_KEY=%s", _redact_token(reetle_api_key))
+        logger.info("FACEBOOK_PAGE_ACCESS_TOKEN=%s", _redact_token(fb_access_token, 12, 6))
+        logger.info("REETLE_API_BASE_URL=%s", REETLE_API_BASE_URL)
     else:
         load_dotenv()
         fb_page_id = os.getenv("FACEBOOK_PAGE_ID")
@@ -83,10 +111,13 @@ def load_secrets():
                 "or INTERNAL_API_KEY in .env"
             )
 
-        logger.info(
-            "Loaded Facebook / internal API from .env; "
-            "database URL from Secret Manager (DATABASE_URL_PRODUCTION)"
-        )
+        section("Startup — credentials (local)")
+        logger.info("ENVIRONMENT=local | Facebook/API from .env | DB from Secret Manager")
+        logger.info("DATABASE_URL (masked)=%s", _mask_database_url(database_url))
+        logger.info("FACEBOOK_PAGE_ID=%s", fb_page_id)
+        logger.info("INTERNAL_API_KEY=%s", _redact_token(reetle_api_key or ""))
+        logger.info("FACEBOOK_PAGE_ACCESS_TOKEN=%s", _redact_token(fb_access_token or "", 12, 6))
+        logger.info("REETLE_API_BASE_URL=%s", REETLE_API_BASE_URL)
 
     return {
         'facebook_page_id': fb_page_id,
@@ -139,9 +170,97 @@ ORDER BY oa.position
 LIMIT 1;
 """
 
+# Logged before the selection query — matches rehearsal (why an article qualifies).
+SELECTION_CRITERIA = (
+    "Selection criteria (article must match all of the following):",
+    "  • Latest article_display_orders row is newer than 3 hours",
+    "  • Article metadata image_model.model = gpt-image-1.5",
+    "  • No social_media_posts row for this article with platform=facebook",
+    "  • Among matches, lowest display position wins (first in the order)",
+)
+
+
+async def log_eligibility_diagnostics(conn) -> None:
+    """When the main query returns nothing, explain likely blockers (same queries as rehearsal)."""
+    logger.info("Diagnostics — why no row matched the full query:")
+    logger.info("── Latest display order age ──")
+    _, rows = await conn.execute_query(
+        "SELECT created_at, NOW() - created_at AS age "
+        "FROM article_display_orders ORDER BY created_at DESC LIMIT 1;"
+    )
+    if rows:
+        r0 = rows[0]
+        created_at = r0["created_at"]
+        age = r0["age"]
+        logger.info("  latest_order created_at=%s age=%s", created_at, age)
+        if hasattr(age, "total_seconds") and age.total_seconds() > 10800:
+            logger.warning(
+                "  → Likely blocker: display order older than 3 hours"
+            )
+        elif hasattr(age, "total_seconds"):
+            logger.info("  → Display order is fresh (< 3 hours)")
+    else:
+        logger.warning("  → No rows in article_display_orders")
+
+    logger.info("── Facebook posts count ──")
+    _, rows = await conn.execute_query(
+        "SELECT COUNT(*) AS cnt FROM social_media_posts WHERE platform = 'facebook';"
+    )
+    if rows:
+        logger.info("  total facebook posts recorded=%s", rows[0]["cnt"])
+
+    logger.info("── Top of current order (see Fresh / Posted / Model vs criteria) ──")
+    _, rows = await conn.execute_query(
+        """
+        WITH latest_order AS (
+            SELECT ordering, created_at
+            FROM article_display_orders
+            ORDER BY created_at DESC
+            LIMIT 1
+        ),
+        ordered_articles AS (
+            SELECT key::int AS position, value::text::int AS article_id
+            FROM latest_order, jsonb_each_text(ordering)
+        )
+        SELECT oa.position, a.id, a.headline->>'es' AS headline_es,
+               a.metadata->'image_model'->>'model' AS img_model,
+               (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours' AS order_fresh,
+               EXISTS (
+                   SELECT 1 FROM social_media_posts s
+                   WHERE s.article_id = a.id AND s.platform = 'facebook'
+               ) AS already_posted
+        FROM ordered_articles oa
+        JOIN articles a ON a.id = oa.article_id
+        ORDER BY oa.position
+        LIMIT 10;
+        """
+    )
+    if not rows:
+        logger.warning("  No articles linked to the latest display order")
+    else:
+        logger.info(
+            "  pos  id  order_fresh  already_posted  img_model  headline_es_snippet"
+        )
+        for r in rows:
+            fresh = "YES" if r["order_fresh"] else "NO"
+            posted = "YES" if r["already_posted"] else "no"
+            model = (r["img_model"] or "none")[:22]
+            hl = (r["headline_es"] or "")[:50]
+            logger.info(
+                "  %3s  %s  %s           %s               %-22s  %s",
+                r["position"],
+                r["id"],
+                fresh,
+                posted,
+                model,
+                hl,
+            )
+
 
 async def init_db():
+    section("Database — connect")
     await Tortoise.init(config=TORTOISE_ORM)
+    logger.info("[OK] Tortoise ORM initialised")
 
 
 CAPTIONS = [
@@ -164,7 +283,10 @@ CAPTIONS = [
 
 
 def build_caption() -> str:
-    return random.choice(CAPTIONS)
+    section("Caption")
+    caption = random.choice(CAPTIONS)
+    logger.info("Selected caption (%d chars): %s", len(caption), caption[:100])
+    return caption
 
 
 def ensure_article_content(article_id: int) -> None:
@@ -173,6 +295,7 @@ def ensure_article_content(article_id: int) -> None:
     Aborts the pipeline (raises) on any non-2xx response so we never post a
     link to content that doesn't exist yet.
     """
+    section("LectIO API — ensure article content")
     url = f"{REETLE_API_BASE_URL}/articles/content/{article_id}"
     headers = {
         "Content-Type": "application/json",
@@ -184,22 +307,30 @@ def ensure_article_content(article_id: int) -> None:
     }
 
     logger.info(
-        "Ensuring article content exists: article_id=%d cefr=%s lang=%s",
-        article_id, CONTENT_CEFR_LEVEL, CONTENT_TARGET_LANGUAGE,
+        "POST %s | article_id=%d cefr=%s lang=%s",
+        url,
+        article_id,
+        CONTENT_CEFR_LEVEL,
+        CONTENT_TARGET_LANGUAGE,
     )
 
     response = requests.post(url, json=payload, headers=headers, timeout=60)
+    logger.info("LectIO response HTTP %s", response.status_code)
 
     if response.status_code in (200, 201):
         logger.info(
-            "Article content confirmed for article_id=%d (%s/%s)",
-            article_id, CONTENT_CEFR_LEVEL, CONTENT_TARGET_LANGUAGE,
+            "[OK] Article content ready for article_id=%d (%s/%s)",
+            article_id,
+            CONTENT_CEFR_LEVEL,
+            CONTENT_TARGET_LANGUAGE,
         )
         return
 
     logger.error(
         "Content generation failed for article_id=%d: HTTP %d — %s",
-        article_id, response.status_code, response.text[:400],
+        article_id,
+        response.status_code,
+        response.text[:400],
     )
     raise RuntimeError(
         f"LectIO content generation failed for article {article_id} "
@@ -209,10 +340,13 @@ def ensure_article_content(article_id: int) -> None:
 
 def publish_link_to_facebook(share_url: str, caption: str) -> str:
     """Publish a link post to the Facebook Page. Returns the post ID."""
+    section("Facebook — publish link post")
     page_id = secrets['facebook_page_id']
     access_token = secrets['facebook_access_token']
 
     url = f"{GRAPH_API_BASE}/{page_id}/feed"
+    logger.info("POST %s | page_id=%s | link=%s", url, page_id, share_url)
+
     response = requests.post(
         url,
         data={
@@ -222,15 +356,31 @@ def publish_link_to_facebook(share_url: str, caption: str) -> str:
         },
         timeout=60,
     )
-    response.raise_for_status()
+    logger.info("Facebook Graph HTTP %s", response.status_code)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        try:
+            logger.error("Facebook error body: %s", response.json())
+        except Exception:
+            logger.error("Facebook error body (raw): %s", response.text[:500])
+        raise
+
     data = response.json()
     post_id = data.get("post_id") or data.get("id")
-    logger.info("Published to Facebook: post_id=%s", post_id)
+    logger.info("[OK] Facebook post_id=%s | https://www.facebook.com/%s", post_id, post_id)
     return post_id
 
 
 async def record_post(article_id: int, post_id: str, caption: str, image_url: str):
     from reetle_models.models import SocialMediaPost
+
+    section("Database — record social_media_posts row")
+    logger.info(
+        "Inserting platform=facebook article_id=%d post_id=%s",
+        article_id,
+        post_id,
+    )
 
     await SocialMediaPost.create(
         article_id=article_id,
@@ -243,43 +393,96 @@ async def record_post(article_id: int, post_id: str, caption: str, image_url: st
             "posted_at_utc": datetime.now(timezone.utc).isoformat(),
         },
     )
-    logger.info("Recorded post in social_media_posts for article_id=%d", article_id)
+    logger.info("[OK] Row saved for article_id=%d", article_id)
 
 
 async def run():
     await init_db()
 
+    section("Pipeline — select article")
     conn = Tortoise.get_connection("default")
+    for line in SELECTION_CRITERIA:
+        logger.info("%s", line)
+    logger.info("Executing selection query…")
     _, rows = await conn.execute_query(SELECTION_QUERY)
 
     if not rows:
-        logger.info("No eligible article found — skipping this slot")
+        section("Result — no post")
+        logger.warning("Query returned 0 rows — no article matched all criteria.")
+        await log_eligibility_diagnostics(conn)
+        logger.info("Exit 0 — nothing to do.")
         return
 
     row = rows[0]
     article_id = row["id"]
+    position = row.get("position")
     headline = row["headline"]
     if isinstance(headline, str):
         headline = json.loads(headline)
-    image_url = row["image_url"]
 
-    headline_es = headline.get("es") or headline.get("en", "")
-    logger.info("Selected article_id=%d headline=%s", article_id, headline_es[:80])
+    metadata = row["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    image_url = row["image_url"]
+    headline_es = headline.get("es") if isinstance(headline, dict) else None
+    headline_en = headline.get("en") if isinstance(headline, dict) else None
+    image_model = (
+        metadata.get("image_model", {}).get("model", "[not found]")
+        if isinstance(metadata, dict)
+        else "[metadata not a dict]"
+    )
+
+    logger.info(
+        "[OK] Eligible article — chosen because it is the first slot in the "
+        "current order that passes freshness, image model, and not-already-posted filters."
+    )
+    logger.info("  article_id       : %s", article_id)
+    logger.info("  display_position : %s", position)
+    logger.info(
+        "  headline_es      : %s",
+        (headline_es or "[no es]")[:120],
+    )
+    logger.info(
+        "  headline_en      : %s",
+        (headline_en or "[no en]")[:120],
+    )
+    logger.info("  image_model      : %s", image_model)
+    logger.info("  image_url        : %s", image_url)
 
     share_url = SHARE_URL_TEMPLATE.format(article_id=article_id)
+    logger.info("Share URL: %s", share_url)
+
     ensure_article_content(article_id)
     caption = build_caption()
     post_id = publish_link_to_facebook(share_url, caption)
 
     await record_post(article_id, post_id, caption, image_url)
-    logger.info("Done — article_id=%d posted to Facebook", article_id)
+    section("Result — success")
+    logger.info(
+        "Posted article_id=%s to Facebook post_id=%s — recorded in DB.",
+        article_id,
+        post_id,
+    )
 
 
 async def main():
+    logger.info("")
+    logger.info(
+        "Reetle Facebook job start | UTC=%s | ENVIRONMENT=%s",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        env,
+    )
     try:
         await run()
+    except Exception:
+        section("Result — FAILED")
+        logger.exception("Pipeline aborted with an exception")
+        raise
     finally:
         await Tortoise.close_connections()
+        logger.info("Database connections closed. Job finished.")
+        logger.info("")
 
 
 if __name__ == "__main__":
