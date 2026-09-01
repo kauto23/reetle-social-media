@@ -2,8 +2,9 @@
 rehearsal.py — Full dress rehearsal for the Reetle Facebook posting pipeline.
 
 Mirrors production logic exactly: reads the database, selects an article,
-builds the article URL, posts a link post to Facebook, and records
-the post in the database — all with detailed logging so every step is unambiguous.
+builds the shortlink URL, composes the branded news card in memory,
+posts a photo post to Facebook, and records the post in the database —
+all with detailed logging so every step is unambiguous.
 
 Usage:
     python rehearsal.py
@@ -19,6 +20,8 @@ import asyncio
 import requests
 from dotenv import load_dotenv
 from tortoise import Tortoise
+
+from image_composer import compose_news_card
 
 # ---------------------------------------------------------------------------
 # Logging — rich console output, always local/stdout for this script
@@ -59,7 +62,7 @@ def warn(msg: str):
 # ---------------------------------------------------------------------------
 
 GRAPH_API_BASE = "https://graph.facebook.com/v22.0"
-ARTICLE_URL_TEMPLATE = "https://reetle.co/?article={article_id}"
+ARTICLE_URL_TEMPLATE = "https://reetle.co/fo/{article_id}"
 
 REETLE_API_BASE_URL = None  # filled in after env is loaded
 CONTENT_CEFR_LEVEL = "A2"
@@ -118,47 +121,51 @@ def load_env() -> dict:
     # Log DB URL with password masked
     if db_url:
         import re
-        masked_db = re.sub(r"(?<=://)([^:]+):([^@]+)@", r"\1:***@", db_url)
-        info(f"DATABASE_URL  = {masked_db}")
+        masked_db = re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", db_url)
+        info(f"DATABASE_URL = {masked_db}")
     else:
-        logger.error("  [FAIL] DATABASE_URL is not set in .env")
-        sys.exit(1)
+        warn("DATABASE_URL is not set!")
 
     if fb_page_id:
         info(f"FACEBOOK_PAGE_ID = {fb_page_id}")
     else:
-        logger.error("  [FAIL] FACEBOOK_PAGE_ID is not set in .env")
-        sys.exit(1)
+        warn("FACEBOOK_PAGE_ID is not set!")
 
     if fb_access_token:
-        visible = fb_access_token[:12] + "..." + fb_access_token[-6:]
-        info(f"FACEBOOK_PAGE_ACCESS_TOKEN = {visible}")
+        preview = fb_access_token[:12] + "..." + fb_access_token[-6:]
+        info(f"FACEBOOK_PAGE_ACCESS_TOKEN = {preview} (length: {len(fb_access_token)})")
     else:
-        logger.error("  [FAIL] FACEBOOK_PAGE_ACCESS_TOKEN is not set in .env")
-        sys.exit(1)
+        warn("FACEBOOK_PAGE_ACCESS_TOKEN is not set!")
+
+    global REETLE_API_BASE_URL
+    REETLE_API_BASE_URL = os.getenv(
+        "REETLE_API_BASE_URL",
+        "https://reetle-api-production-507485624349.us-central1.run.app/api",
+    )
+    info(f"REETLE_API_BASE_URL = {REETLE_API_BASE_URL}")
 
     reetle_api_key = os.getenv("INTERNAL_API_KEY")
     if reetle_api_key:
-        visible = reetle_api_key[:8] + "..." + reetle_api_key[-4:]
-        info(f"INTERNAL_API_KEY = {visible}")
+        preview_key = reetle_api_key[:6] + "..." + reetle_api_key[-4:]
+        info(f"INTERNAL_API_KEY = {preview_key}")
     else:
-        logger.error("  [FAIL] INTERNAL_API_KEY is not set in .env")
+        warn("INTERNAL_API_KEY is not set!")
+
+    missing = []
+    if not db_url:
+        missing.append("DATABASE_URL")
+    if not fb_page_id:
+        missing.append("FACEBOOK_PAGE_ID")
+    if not fb_access_token:
+        missing.append("FACEBOOK_PAGE_ACCESS_TOKEN")
+    if not reetle_api_key:
+        missing.append("INTERNAL_API_KEY")
+
+    if missing:
+        logger.error("  [FAIL] Missing required environment variables: %s", ", ".join(missing))
         sys.exit(1)
 
-    reetle_api_base = os.getenv("REETLE_API_BASE_URL")
-    info(f"REETLE_API_BASE_URL = {reetle_api_base}")
-
-    global REETLE_API_BASE_URL
-    REETLE_API_BASE_URL = reetle_api_base
-
-    gcp_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if gcp_creds:
-        info(f"GOOGLE_APPLICATION_CREDENTIALS = {gcp_creds}")
-    else:
-        info("GOOGLE_APPLICATION_CREDENTIALS = (not set — will use ADC)")
-
     ok("All required environment variables are present")
-
     return {
         "database_url": db_url,
         "facebook_page_id": fb_page_id,
@@ -168,54 +175,65 @@ def load_env() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Connect to database
+# Step 2 — Initialise database
 # ---------------------------------------------------------------------------
 
-async def init_db(database_url: str):
+async def init_db(db_url: str):
     section("Step 2 — Connect to database")
-    TORTOISE_ORM["connections"]["default"] = database_url
+    TORTOISE_ORM["connections"]["default"] = db_url
+    logger.info("        Connecting to PostgreSQL via Tortoise ORM…")
     await Tortoise.init(config=TORTOISE_ORM)
-    ok("Tortoise ORM initialised — database connection established")
+    ok("Database connection established")
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Run selection query
+# Step 3 — Article selection & diagnostics
 # ---------------------------------------------------------------------------
 
-async def run_diagnostics(conn):
-    """Run targeted queries to explain why the main selection returned nothing."""
-    info("")
-    info("── Diagnostic 1: How old is the latest display order? ──────────────")
+async def run_diagnostics(conn) -> None:
+    """Run four targeted sub-queries to pinpoint exactly why 0 rows matched."""
+    info("── Diagnostics: why did the selection query return 0 rows? ──")
+
+    # Diag 1: Latest display order
     _, rows = await conn.execute_query(
-        "SELECT created_at, NOW() - created_at AS age "
-        "FROM article_display_orders ORDER BY created_at DESC LIMIT 1;"
+        """
+        SELECT created_at, NOW() - created_at AS age
+        FROM article_display_orders
+        ORDER BY created_at DESC
+        LIMIT 1;
+        """
     )
-    if rows:
-        row = rows[0]
-        created_at = row["created_at"]
-        age = row["age"]
-        info(f"  Latest display order created_at : {created_at}")
-        info(f"  Age                             : {age}")
-        if hasattr(age, "total_seconds") and age.total_seconds() > 10800:
-            warn("  → Display order is older than 3 hours — this is the blocking condition")
-        elif not hasattr(age, "total_seconds"):
-            info(f"  → Age reported as: {age}")
-        else:
-            ok("  → Display order is fresh (< 3 hours)")
+    if not rows:
+        warn("article_display_orders table is EMPTY — no ranking has ever been computed")
     else:
-        warn("  → No rows found in article_display_orders at all")
+        created_at = rows[0]["created_at"]
+        age = rows[0]["age"]
+        is_fresh = age.total_seconds() <= 10800 if hasattr(age, "total_seconds") else False
+        status_fn = ok if is_fresh else warn
+        status_fn(
+            f"Latest article_display_orders: created_at={created_at} (age={age}) "
+            f"-> {'FRESH (<3h)' if is_fresh else 'STALE (>3h — blocks posting!)'}"
+        )
 
-    info("")
-    info("── Diagnostic 2: Articles already posted to Facebook ───────────────")
+    # Diag 2: Facebook posts count
     _, rows = await conn.execute_query(
         "SELECT COUNT(*) AS cnt FROM social_media_posts WHERE platform = 'facebook';"
     )
-    if rows:
-        cnt = rows[0]["cnt"]
-        info(f"  Total Facebook posts recorded : {cnt}")
+    cnt = rows[0]["cnt"] if rows else 0
+    info(f"Total rows in social_media_posts with platform='facebook': {cnt}")
 
-    info("")
-    info("── Diagnostic 3: Candidate articles (ignoring already-posted filter) ─")
+    # Diag 3: gpt-image-1.5 articles count
+    _, rows = await conn.execute_query(
+        """
+        SELECT COUNT(*) AS cnt FROM articles
+        WHERE metadata->'image_model'->>'model' = 'gpt-image-1.5'
+          AND image_url IS NOT NULL;
+        """
+    )
+    cnt = rows[0]["cnt"] if rows else 0
+    info(f"Total articles with model='gpt-image-1.5' and non-null image_url: {cnt}")
+
+    # Diag 4: Top 10 articles in the current order
     _, rows = await conn.execute_query(
         """
         WITH latest_order AS (
@@ -242,10 +260,11 @@ async def run_diagnostics(conn):
         """
     )
     if not rows:
-        warn("  No articles found in the current display order at all")
+        warn("No articles found matching the article IDs in latest_order")
     else:
-        info(f"  {'Pos':>3}  {'ID':>6}  {'Fresh':>5}  {'Posted':>6}  {'Model':<22}  Headline")
-        info(f"  {'───':>3}  {'──────':>6}  {'─────':>5}  {'──────':>6}  {'──────────────────────':<22}  ────────────────────────────────")
+        info("Top 10 articles in current display order vs selection criteria:")
+        info("  Pos  ArtID  Fresh?  Posted?  Image Model             Headline (ES)")
+        info("  ───  ─────  ──────  ───────  ──────────────────────  ─────────────")
         for r in rows:
             fresh = "YES" if r["order_fresh"] else "NO"
             posted = "YES" if r["already_posted"] else "no"
@@ -292,10 +311,13 @@ async def select_article() -> dict | None:
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
 
+    headline_es = headline.get("es") if isinstance(headline, dict) else None
+    headline_en = headline.get("en") if isinstance(headline, dict) else None
+
     ok(f"Eligible article found at display position #{position}")
     info(f"  article_id  : {article_id}")
-    info(f"  headline_es : {headline.get('es', '[no es headline]')[:120]}")
-    info(f"  headline_en : {headline.get('en', '[no en headline]')[:120]}")
+    info(f"  headline_es : {(headline_es or '[no es headline]')[:120]}")
+    info(f"  headline_en : {(headline_en or '[no en headline]')[:120]}")
     info(f"  image_url   : {image_url}")
 
     image_model = (
@@ -308,59 +330,32 @@ async def select_article() -> dict | None:
     return {
         "article_id": article_id,
         "headline": headline,
+        "headline_es": headline_es,
+        "headline_en": headline_en,
         "image_url": image_url,
         "position": position,
     }
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Verify article URL is reachable
+# Step 4 — Verify article shortlink
 # ---------------------------------------------------------------------------
 
-def verify_article_url(article_url: str, access_token: str) -> None:
-    section("Step 4 — Verify OG article URL & Facebook scrape")
-
-    info(f"Article URL : {article_url}")
-
-    info("")
-    info("── 4a: GET article URL ──")
-    get_resp = requests.get(article_url, timeout=15)
-    info(f"HTTP status  : {get_resp.status_code}")
-    info(f"Content-Type : {get_resp.headers.get('Content-Type', '(missing)')}")
-    info(f"Body length  : {len(get_resp.text)} chars")
-
-    has_og_title = 'og:title' in get_resp.text
-    has_og_image = 'og:image' in get_resp.text
-    if has_og_title and has_og_image:
-        ok("HTML contains og:title and og:image")
-    else:
-        warn(f"og:title present={has_og_title}, og:image present={has_og_image}")
-
-    # 4c — Force Facebook to scrape the URL and log what it caches
-    info("")
-    info("── 4c: Force Facebook scrape (what does Facebook see?) ──")
-    scrape_resp = requests.post(
-        "https://graph.facebook.com/v22.0/",
-        data={
-            "id": article_url,
-            "scrape": "true",
-            "access_token": access_token,
-        },
-        timeout=30,
-    )
-    info(f"Scrape HTTP status : {scrape_resp.status_code}")
-    info(f"Scrape response    :")
+def verify_shortlink(article_url: str) -> None:
+    section("Step 4 — Verify shortlink URL")
+    info(f"Shortlink URL : {article_url}")
     try:
-        scrape_data = scrape_resp.json()
-        for k, v in scrape_data.items():
-            info(f"  {k} = {v}")
-        og_title = scrape_data.get("title")
-        if og_title:
-            ok(f"Facebook cached og:title = {og_title[:120]}")
+        resp = requests.get(article_url, timeout=10, allow_redirects=False)
+        info(f"HTTP Status   : {resp.status_code}")
+        if resp.status_code in (301, 302, 307, 308):
+            redirect_to = resp.headers.get("Location", "(none)")
+            ok(f"Shortlink redirects to: {redirect_to}")
+        elif resp.status_code == 200:
+            ok("Shortlink returned HTTP 200")
         else:
-            warn("Facebook returned NO og:title — the post card will be blank")
-    except Exception:
-        warn(f"Could not parse scrape response: {scrape_resp.text[:400]}")
+            info(f"Shortlink status code: {resp.status_code} (check website deployment if 404)")
+    except Exception as exc:
+        warn(f"Shortlink verification request failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +411,24 @@ def ensure_article_content(article_id: int, api_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Build caption
+# Step 6 — Compose news card in memory
+# ---------------------------------------------------------------------------
+
+def compose_card(image_url: str, headline: str) -> bytes:
+    section("Step 6 — Compose branded news card in memory")
+    info(f"Source image : {image_url}")
+    info(f"Headline     : {headline}")
+
+    image_bytes = compose_news_card(
+        image_source=image_url,
+        headline=headline,
+    )
+    ok(f"News card composed in memory — {len(image_bytes):,} bytes")
+    return image_bytes
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — Build caption
 # ---------------------------------------------------------------------------
 
 CAPTIONS = [
@@ -438,46 +450,46 @@ CAPTIONS = [
 ]
 
 
-def build_caption() -> str:
-    section("Step 6 — Build post caption")
+def build_caption(article_url: str) -> str:
+    section("Step 7 — Build post caption")
 
-    caption = random.choice(CAPTIONS)
+    hook = random.choice(CAPTIONS)
+    caption = f"{hook}\n\n👉 Read story: {article_url}"
 
     info("Caption text:")
-    info(f"  {caption}")
-    info("")
-    info("Note: The Spanish headline and article image will appear automatically")
-    info("      in the link preview card generated by Facebook from the OG tags.")
+    for line in caption.split("\n"):
+        info(f"  {line}")
 
     ok(f"Caption built — {len(caption)} characters")
     return caption
 
 
 # ---------------------------------------------------------------------------
-# Step 7 — Publish to Facebook
+# Step 8 — Publish photo post to Facebook
 # ---------------------------------------------------------------------------
 
 def publish_to_facebook(
-    article_url: str,
+    image_bytes: bytes,
     caption: str,
     page_id: str,
     access_token: str,
 ) -> str:
-    section("Step 7 — Publish link post to Facebook Page")
+    section("Step 8 — Publish photo post to Facebook Page")
 
-    url = f"{GRAPH_API_BASE}/{page_id}/feed"
-    info(f"Endpoint  : POST {url}")
-    info(f"Page ID   : {page_id}")
-    info(f"message   : {caption}")
-    info(f"link      : {article_url}")
-    logger.info("        Sending request to Facebook Graph API…")
+    url = f"{GRAPH_API_BASE}/{page_id}/photos"
+    info(f"Endpoint     : POST {url}")
+    info(f"Page ID      : {page_id}")
+    info(f"Image size   : {len(image_bytes):,} bytes")
+    logger.info("        Sending multipart POST request to Facebook Graph API…")
 
     response = requests.post(
         url,
         data={
-            "message": caption,
-            "link": article_url,
+            "caption": caption,
             "access_token": access_token,
+        },
+        files={
+            "source": ("card.png", image_bytes, "image/png"),
         },
         timeout=60,
     )
@@ -504,14 +516,14 @@ def publish_to_facebook(
         logger.error("  [FAIL] No post_id or id in Facebook response: %s", data)
         sys.exit(1)
 
-    ok(f"Post published successfully — Facebook post_id = {post_id}")
+    ok(f"Photo post published successfully — Facebook post_id = {post_id}")
     info(f"Post URL : https://www.facebook.com/{post_id}")
 
     return post_id
 
 
 # ---------------------------------------------------------------------------
-# Step 8 — Record post in database
+# Step 9 — Record post in database
 # ---------------------------------------------------------------------------
 
 async def record_post(
@@ -521,7 +533,7 @@ async def record_post(
     image_url: str,
     page_id: str,
 ):
-    section("Step 8 — Record post in social_media_posts table")
+    section("Step 9 — Record post in social_media_posts table")
 
     from reetle_models.models import SocialMediaPost
 
@@ -571,14 +583,25 @@ async def run(cfg: dict):
 
     article_url = ARTICLE_URL_TEMPLATE.format(article_id=article["article_id"])
 
-    verify_article_url(article_url, cfg["facebook_access_token"])
+    verify_shortlink(article_url)
 
     ensure_article_content(article["article_id"], cfg["reetle_internal_api_key"])
 
-    caption = build_caption()
+    spanish_headline = (
+        article.get("headline_es")
+        or article.get("headline_en")
+        or "Noticia de última hora"
+    )
+
+    image_bytes = compose_card(
+        image_url=article["image_url"],
+        headline=spanish_headline,
+    )
+
+    caption = build_caption(article_url)
 
     post_id = publish_to_facebook(
-        article_url=article_url,
+        image_bytes=image_bytes,
         caption=caption,
         page_id=cfg["facebook_page_id"],
         access_token=cfg["facebook_access_token"],

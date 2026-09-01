@@ -4,4 +4,5 @@ tortoise-orm
 asyncpg
 google-cloud-storage
 google-cloud-secret-manager
+Pillow>=10.0.0
 reetle-models @ git+https://github.com/kauto23/reetle-models.git@main

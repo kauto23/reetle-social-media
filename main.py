@@ -9,6 +9,8 @@ from tortoise import Tortoise
 from dotenv import load_dotenv
 import requests
 
+from image_composer import compose_news_card
+
 env = os.getenv('ENVIRONMENT', 'local')
 
 # Cloud Run ingests stdout/stderr into Cloud Logging. The google-cloud-logging
@@ -132,7 +134,7 @@ TORTOISE_ORM = {
 }
 
 GRAPH_API_BASE = "https://graph.facebook.com/v22.0"
-ARTICLE_URL_TEMPLATE = "https://reetle.co/?article={article_id}"
+ARTICLE_URL_TEMPLATE = "https://reetle.co/fo/{article_id}"
 
 CONTENT_CEFR_LEVEL = "A2"
 CONTENT_TARGET_LANGUAGE = "es"
@@ -272,10 +274,11 @@ CAPTIONS = [
 ]
 
 
-def build_caption() -> str:
+def build_caption(article_url: str) -> str:
     section("Caption")
-    caption = random.choice(CAPTIONS)
-    logger.info("Selected caption (%d chars): %s", len(caption), caption[:100])
+    hook = random.choice(CAPTIONS)
+    caption = f"{hook}\n\n👉 Read story: {article_url}"
+    logger.info("Selected caption (%d chars):\n%s", len(caption), caption)
     return caption
 
 
@@ -328,50 +331,23 @@ def ensure_article_content(article_id: int) -> None:
     )
 
 
-def prescrape_article_url(article_url: str) -> None:
-    """Warm up the article URL and force Facebook to cache the OG data before posting."""
-    section("Facebook — pre-scrape OG data")
-
-    logger.info("Warming up article URL: GET %s", article_url)
-    warm_resp = requests.get(article_url, timeout=15)
-    logger.info("Article URL HTTP %s (%d bytes)", warm_resp.status_code, len(warm_resp.content))
-
-    access_token = secrets["facebook_access_token"]
-    logger.info("Forcing Facebook scrape: POST graph.facebook.com/?id=...&scrape=true")
-    scrape_resp = requests.post(
-        f"{GRAPH_API_BASE}/",
-        data={
-            "id": article_url,
-            "scrape": "true",
-            "access_token": access_token,
-        },
-        timeout=30,
-    )
-    logger.info("Scrape response HTTP %s", scrape_resp.status_code)
-
-    try:
-        scrape_data = scrape_resp.json()
-        og_title = scrape_data.get("title", "(missing)")
-        logger.info("Facebook cached og:title = %s", og_title[:120])
-    except Exception:
-        logger.warning("Could not parse scrape response: %s", scrape_resp.text[:300])
-
-
-def publish_link_to_facebook(article_url: str, caption: str) -> str:
-    """Publish a link post to the Facebook Page. Returns the post ID."""
-    section("Facebook — publish link post")
+def publish_photo_to_facebook(image_bytes: bytes, caption: str) -> str:
+    """Publish a photo post to the Facebook Page. Returns the post ID."""
+    section("Facebook — publish photo post")
     page_id = secrets['facebook_page_id']
     access_token = secrets['facebook_access_token']
 
-    url = f"{GRAPH_API_BASE}/{page_id}/feed"
-    logger.info("POST %s | page_id=%s | link=%s", url, page_id, article_url)
+    url = f"{GRAPH_API_BASE}/{page_id}/photos"
+    logger.info("POST %s | page_id=%s | image_bytes=%d", url, page_id, len(image_bytes))
 
     response = requests.post(
         url,
         data={
-            "message": caption,
-            "link": article_url,
+            "caption": caption,
             "access_token": access_token,
+        },
+        files={
+            "source": ("card.png", image_bytes, "image/png"),
         },
         timeout=60,
     )
@@ -473,9 +449,18 @@ async def run():
     logger.info("Article URL: %s", article_url)
 
     ensure_article_content(article_id)
-    prescrape_article_url(article_url)
-    caption = build_caption()
-    post_id = publish_link_to_facebook(article_url, caption)
+
+    section("Image — compose news card")
+    spanish_headline = headline_es or (headline.get("en") if isinstance(headline, dict) else "") or "Noticia de última hora"
+    logger.info("Composing card with headline: %s", spanish_headline)
+    image_bytes = compose_news_card(
+        image_source=image_url,
+        headline=spanish_headline,
+    )
+    logger.info("[OK] Composed news card (%d bytes in memory)", len(image_bytes))
+
+    caption = build_caption(article_url)
+    post_id = publish_photo_to_facebook(image_bytes, caption)
 
     await record_post(article_id, post_id, caption, image_url)
     section("Result — success")
