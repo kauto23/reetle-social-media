@@ -21,7 +21,7 @@ import requests
 from dotenv import load_dotenv
 from tortoise import Tortoise
 
-from image_composer import compose_news_card
+from image_composer import compose_news_card, compose_news_card_jpeg
 
 # ---------------------------------------------------------------------------
 # Logging — rich console output, always local/stdout for this script
@@ -85,7 +85,7 @@ JOIN articles a ON a.id = oa.article_id
 WHERE (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours'
   AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
   AND a.id NOT IN (
-      SELECT article_id FROM social_media_posts WHERE platform = 'facebook'
+      SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
   )
 ORDER BY oa.position
 LIMIT 1;
@@ -102,6 +102,27 @@ TORTOISE_ORM = {
 }
 
 
+def _resolve_page_access_token(token: str, page_id: str) -> str:
+    """If given a System User or User token, auto-resolves it to the Page Access Token."""
+    if not token or not page_id:
+        return token
+    try:
+        url = f"https://graph.facebook.com/v22.0/{page_id}"
+        resp = requests.get(
+            url,
+            params={"fields": "access_token", "access_token": token},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            resolved = data.get("access_token")
+            if resolved:
+                return resolved
+    except Exception as exc:
+        logger.warning("Could not auto-resolve Page Access Token: %s", exc)
+    return token
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — Load environment
 # ---------------------------------------------------------------------------
@@ -116,7 +137,9 @@ def load_env() -> dict:
 
     db_url = os.getenv("DATABASE_URL")
     fb_page_id = os.getenv("FACEBOOK_PAGE_ID")
-    fb_access_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+    raw_fb_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+    fb_access_token = _resolve_page_access_token(raw_fb_token, fb_page_id)
+    ig_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "17841425089520891")
 
     # Log DB URL with password masked
     if db_url:
@@ -130,6 +153,11 @@ def load_env() -> dict:
         info(f"FACEBOOK_PAGE_ID = {fb_page_id}")
     else:
         warn("FACEBOOK_PAGE_ID is not set!")
+
+    if ig_account_id:
+        info(f"INSTAGRAM_ACCOUNT_ID = {ig_account_id}")
+    else:
+        warn("INSTAGRAM_ACCOUNT_ID is not set!")
 
     if fb_access_token:
         preview = fb_access_token[:12] + "..." + fb_access_token[-6:]
@@ -170,6 +198,7 @@ def load_env() -> dict:
         "database_url": db_url,
         "facebook_page_id": fb_page_id,
         "facebook_access_token": fb_access_token,
+        "instagram_account_id": ig_account_id,
         "reetle_internal_api_key": reetle_api_key,
     }
 
@@ -215,23 +244,27 @@ async def run_diagnostics(conn) -> None:
             f"-> {'FRESH (<3h)' if is_fresh else 'STALE (>3h — blocks posting!)'}"
         )
 
-    # Diag 2: Facebook posts count
+    # Diag 2: Social media posts count
     _, rows = await conn.execute_query(
-        "SELECT COUNT(*) AS cnt FROM social_media_posts WHERE platform = 'facebook';"
+        "SELECT platform, COUNT(*) AS cnt FROM social_media_posts "
+        "WHERE platform IN ('facebook', 'instagram') GROUP BY platform;"
     )
-    cnt = rows[0]["cnt"] if rows else 0
-    info(f"Total rows in social_media_posts with platform='facebook': {cnt}")
+    if rows:
+        for r in rows:
+            info(f"Total rows in social_media_posts with platform='{r['platform']}': {r['cnt']}")
+    else:
+        info("No rows in social_media_posts for facebook or instagram yet")
 
     # Diag 3: gpt-image-1.5 articles count
     _, rows = await conn.execute_query(
         """
         SELECT COUNT(*) AS cnt FROM articles
-        WHERE metadata->'image_model'->>'model' = 'gpt-image-1.5'
+        WHERE metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
           AND image_url IS NOT NULL;
         """
     )
     cnt = rows[0]["cnt"] if rows else 0
-    info(f"Total articles with model='gpt-image-1.5' and non-null image_url: {cnt}")
+    info(f"Total articles with model in ('gemini-3.1-flash-image', 'gpt-image-1.5') and non-null image_url: {cnt}")
 
     # Diag 4: Top 10 articles in the current order
     _, rows = await conn.execute_query(
@@ -251,7 +284,7 @@ async def run_diagnostics(conn) -> None:
                (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours' AS order_fresh,
                EXISTS (
                    SELECT 1 FROM social_media_posts s
-                   WHERE s.article_id = a.id AND s.platform = 'facebook'
+                   WHERE s.article_id = a.id AND s.platform IN ('facebook', 'instagram')
                ) AS already_posted
         FROM ordered_articles oa
         JOIN articles a ON a.id = oa.article_id
@@ -281,7 +314,7 @@ async def select_article() -> dict | None:
     info("Selection criteria:")
     info("  • Latest article_display_orders entry must be < 3 hours old")
     info("  • Article image model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')")
-    info("  • Article must not already have a Facebook post recorded")
+    info("  • Article must not already have a post recorded on Facebook or Instagram")
     info("  • First article by display position is chosen")
     info("")
 
@@ -415,57 +448,93 @@ def ensure_article_content(article_id: int, api_key: str) -> None:
 # ---------------------------------------------------------------------------
 
 def compose_card(image_url: str, headline: str) -> bytes:
-    section("Step 6 — Compose branded news card in memory")
+    section("Step 6 — Compose branded news card in memory (JPEG)")
     info(f"Source image : {image_url}")
     info(f"Headline     : {headline}")
 
-    image_bytes = compose_news_card(
+    image_bytes = compose_news_card_jpeg(
         image_source=image_url,
         headline=headline,
     )
-    ok(f"News card composed in memory — {len(image_bytes):,} bytes")
+    ok(f"JPEG News card composed in memory — {len(image_bytes):,} bytes")
     return image_bytes
 
 
 # ---------------------------------------------------------------------------
-# Step 7 — Build caption
+# Step 7 — Upload card to GCS
 # ---------------------------------------------------------------------------
 
-CAPTIONS = [
+def upload_to_gcs(jpeg_bytes: bytes, article_id: int) -> str:
+    section("Step 7 — Upload JPEG card to GCS for Instagram")
+    from google.cloud import storage
+
+    client = storage.Client(project="lect-io")
+    bucket = client.bucket("lect-io-articles")
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    blob_name = f"images/social_cards/article_{article_id}_{timestamp}.jpeg"
+    blob = bucket.blob(blob_name)
+    info(f"Uploading {len(jpeg_bytes):,} bytes to gs://lect-io-articles/{blob_name}")
+    blob.upload_from_string(jpeg_bytes, content_type="image/jpeg")
+    public_url = f"https://storage.googleapis.com/lect-io-articles/{blob_name}"
+    ok(f"Card available publicly at: {public_url}")
+    return public_url
+
+
+# ---------------------------------------------------------------------------
+# Step 8 — Build captions
+# ---------------------------------------------------------------------------
+
+HOOKS = [
+    "Real news. Real Spanish. Written for your level.",
     "Improve your Spanish by reading today's real news, written for your level.",
     "Learn Spanish without flashcards. Just read the news.",
-    "Real news. Real Spanish. Written for your level.",
-    "Today's news in Spanish. Tap any word you don't know to see the translation.",
     "Spanish news you can actually understand, matched to your reading level.",
-    "Think Spanish news is too hard? Not when it's written for your level.",
-    "Read today's news in Spanish. Stuck on a word? Just tap it for the translation.",
+    "Today's news in Spanish, adapted to your reading level.",
     "Forget textbooks. Learn Spanish from stories the world is actually talking about.",
+    "Stay informed and build your Spanish at the same time.",
     "Your daily Spanish reading is ready. Today's real news, written for your level.",
     "Every article you read in Spanish makes the next one easier.",
-    "Read real Spanish news with built-in translations. No dictionary needed.",
-    "Not sure what a word means? Tap it. That's how you learn Spanish here.",
-    "Stay informed and learn Spanish at the same time. Real news, your level.",
-    "You don't need to understand every word. Tap the ones you don't and keep reading.",
-    "Spanish news with instant translations when you need them. Written for your level.",
+    "Read real Spanish news without getting stuck on difficult vocabulary.",
+    "Real journalism in Spanish, edited for language learners.",
+    "Understand Spanish news naturally, one story at a time.",
+    "Current affairs in Spanish, tailored to your reading level.",
+    "Improve your Spanish reading with today's top stories.",
+    "Real news in Spanish. Written for your level, not native fluency.",
 ]
 
 
-def build_caption(article_url: str) -> str:
-    section("Step 7 — Build post caption")
+def build_facebook_caption(article_url: str, hook: str | None = None) -> str:
+    section("Step 8a — Build Facebook caption")
 
-    hook = random.choice(CAPTIONS)
-    caption = f"{hook}\n\n👉 Read story: {article_url}"
+    if not hook:
+        hook = random.choice(HOOKS)
+    caption = f"{hook}\n\nRead the full story with instant translations: {article_url}"
 
-    info("Caption text:")
+    info("Facebook caption text:")
     for line in caption.split("\n"):
         info(f"  {line}")
 
-    ok(f"Caption built — {len(caption)} characters")
+    ok(f"Facebook caption built — {len(caption)} characters")
+    return caption
+
+
+def build_instagram_caption(hook: str | None = None) -> str:
+    section("Step 8b — Build Instagram caption (BBC / Sky News style)")
+
+    if not hook:
+        hook = random.choice(HOOKS)
+    caption = f"{hook}\n\nTap the link in bio to read the full story with instant translations."
+
+    info("Instagram caption text:")
+    for line in caption.split("\n"):
+        info(f"  {line}")
+
+    ok(f"Instagram caption built — {len(caption)} characters")
     return caption
 
 
 # ---------------------------------------------------------------------------
-# Step 8 — Publish photo post to Facebook
+# Step 9 — Publish photo post to Facebook
 # ---------------------------------------------------------------------------
 
 def publish_to_facebook(
@@ -474,7 +543,7 @@ def publish_to_facebook(
     page_id: str,
     access_token: str,
 ) -> str:
-    section("Step 8 — Publish photo post to Facebook Page")
+    section("Step 9 — Publish photo post to Facebook Page")
 
     url = f"{GRAPH_API_BASE}/{page_id}/photos"
     info(f"Endpoint     : POST {url}")
@@ -523,47 +592,141 @@ def publish_to_facebook(
 
 
 # ---------------------------------------------------------------------------
-# Step 9 — Record post in database
+# Step 10 — Publish photo post to Instagram
+# ---------------------------------------------------------------------------
+
+def publish_to_instagram(
+    image_url: str,
+    caption: str,
+    ig_user_id: str,
+    access_token: str,
+) -> str:
+    section("Step 10 — Publish photo post to Instagram (@reetlespanish)")
+
+    # 1. Create Media Container
+    create_url = f"{GRAPH_API_BASE}/{ig_user_id}/media"
+    info(f"Step 10.1: Create Container -> POST {create_url}")
+    info(f"IG Account ID: {ig_user_id}")
+    info(f"Image URL    : {image_url}")
+
+    create_resp = requests.post(
+        create_url,
+        data={
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": access_token,
+        },
+        timeout=60,
+    )
+    info(f"HTTP status : {create_resp.status_code}")
+
+    try:
+        create_resp.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.error("  [FAIL] Instagram create container failed")
+        logger.error("         Status : %s", create_resp.status_code)
+        try:
+            logger.error("         Body   : %s", create_resp.json())
+        except Exception:
+            logger.error("         Body   : %s", create_resp.text[:400])
+        raise exc
+
+    container_id = create_resp.json().get("id")
+    ok(f"Media container created — container_id = {container_id}")
+
+    # 2. Wait for Container processing
+    status_url = f"{GRAPH_API_BASE}/{container_id}"
+    import time
+    for attempt in range(1, 7):
+        info(f"Checking container status (attempt {attempt}/6)…")
+        status_resp = requests.get(
+            status_url,
+            params={"fields": "status_code", "access_token": access_token},
+            timeout=30,
+        )
+        if status_resp.status_code == 200:
+            status_code = status_resp.json().get("status_code")
+            info(f"Status code: {status_code}")
+            if status_code == "FINISHED":
+                break
+            if status_code in ("ERROR", "EXPIRED"):
+                raise RuntimeError(f"Instagram media container failed with status: {status_code}")
+        time.sleep(2)
+
+    # 3. Publish Container
+    publish_url = f"{GRAPH_API_BASE}/{ig_user_id}/media_publish"
+    info(f"Step 10.2: Publish Container -> POST {publish_url}")
+    publish_resp = requests.post(
+        publish_url,
+        data={
+            "creation_id": container_id,
+            "access_token": access_token,
+        },
+        timeout=60,
+    )
+    info(f"HTTP status : {publish_resp.status_code}")
+
+    try:
+        publish_resp.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.error("  [FAIL] Instagram publish failed")
+        logger.error("         Status : %s", publish_resp.status_code)
+        try:
+            logger.error("         Body   : %s", publish_resp.json())
+        except Exception:
+            logger.error("         Body   : %s", publish_resp.text[:400])
+        raise exc
+
+    ig_post_id = publish_resp.json().get("id")
+    ok(f"Instagram post published successfully — ig_post_id = {ig_post_id}")
+    return ig_post_id
+
+
+# ---------------------------------------------------------------------------
+# Step 11 — Record post in database
 # ---------------------------------------------------------------------------
 
 async def record_post(
     article_id: int,
+    platform: str,
     post_id: str,
     caption: str,
     image_url: str,
-    page_id: str,
+    extra_meta: dict = None,
 ):
-    section("Step 9 — Record post in social_media_posts table")
+    section(f"Step 11 — Record post in social_media_posts table ({platform})")
 
     from reetle_models.models import SocialMediaPost
 
     posted_at = datetime.now(timezone.utc).isoformat()
 
     record_metadata = {
-        "page_id": page_id,
         "caption": caption,
         "image_url": image_url,
         "posted_at_utc": posted_at,
     }
+    if extra_meta:
+        record_metadata.update(extra_meta)
 
     info("Inserting record:")
     info(f"  article_id : {article_id}")
-    info(f"  platform   : facebook")
+    info(f"  platform   : {platform}")
     info(f"  post_id    : {post_id}")
     info(f"  metadata   :")
-    info(f"    page_id       : {page_id}")
-    info(f"    image_url     : {image_url}")
-    info(f"    posted_at_utc : {posted_at}")
-    info(f"    caption       : {caption[:60]}…")
+    for k, v in record_metadata.items():
+        val_str = str(v)
+        if len(val_str) > 60:
+            val_str = val_str[:60] + "…"
+        info(f"    {k:<14} : {val_str}")
 
     await SocialMediaPost.create(
         article_id=article_id,
-        platform="facebook",
+        platform=platform,
         post_id=post_id,
         metadata=record_metadata,
     )
 
-    ok(f"Row inserted into social_media_posts — article_id={article_id}, post_id={post_id}")
+    ok(f"Row inserted into social_media_posts — platform={platform}, article_id={article_id}, post_id={post_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -598,36 +761,60 @@ async def run(cfg: dict):
         headline=spanish_headline,
     )
 
-    caption = build_caption(article_url)
+    # Upload JPEG to GCS for public Instagram fetch
+    gcs_card_url = upload_to_gcs(image_bytes, article["article_id"])
 
-    post_id = publish_to_facebook(
+    # Select editorial hook for this story
+    hook = random.choice(HOOKS)
+
+    # 1. Facebook Post
+    fb_caption = build_facebook_caption(article_url, hook=hook)
+    fb_post_id = publish_to_facebook(
         image_bytes=image_bytes,
-        caption=caption,
+        caption=fb_caption,
         page_id=cfg["facebook_page_id"],
         access_token=cfg["facebook_access_token"],
     )
-
     await record_post(
         article_id=article["article_id"],
-        post_id=post_id,
-        caption=caption,
-        image_url=article["image_url"],
-        page_id=cfg["facebook_page_id"],
+        platform="facebook",
+        post_id=fb_post_id,
+        caption=fb_caption,
+        image_url=gcs_card_url,
+        extra_meta={"page_id": cfg["facebook_page_id"]},
+    )
+
+    # 2. Instagram Post
+    ig_caption = build_instagram_caption(hook=hook)
+    ig_post_id = publish_to_instagram(
+        image_url=gcs_card_url,
+        caption=ig_caption,
+        ig_user_id=cfg["instagram_account_id"],
+        access_token=cfg["facebook_access_token"],
+    )
+    await record_post(
+        article_id=article["article_id"],
+        platform="instagram",
+        post_id=ig_post_id,
+        caption=ig_caption,
+        image_url=gcs_card_url,
+        extra_meta={"account_id": cfg["instagram_account_id"]},
     )
 
     section("Result — success")
-    ok(f"Article {article['article_id']} posted to Facebook and recorded in the database.")
-    ok(f"Facebook post_id : {post_id}")
-    ok(f"Post URL         : https://www.facebook.com/{post_id}")
+    ok(f"Article {article['article_id']} posted to Facebook and Instagram and recorded in the database.")
+    ok(f"Facebook post_id  : {fb_post_id}")
+    ok(f"Facebook Post URL : https://www.facebook.com/{fb_post_id}")
+    ok(f"Instagram post_id : {ig_post_id}")
     info("")
-    info("The database now contains a social_media_posts record for this article.")
+    info("The database now contains social_media_posts records for both platforms.")
     info("If this scheduler slot were to run again, this article would be skipped.")
 
 
 async def main():
     logger.info("")
     logger.info("╔══════════════════════════════════════════════════════════════════════╗")
-    logger.info("║          REETLE — FACEBOOK POSTING PIPELINE DRESS REHEARSAL         ║")
+    logger.info("║     REETLE — FACEBOOK & INSTAGRAM DUAL POSTING DRESS REHEARSAL       ║")
     logger.info("║  Mirrors production logic exactly. Posts are REAL and will go live. ║")
     logger.info("╚══════════════════════════════════════════════════════════════════════╝")
     logger.info("  Started at: %s UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))

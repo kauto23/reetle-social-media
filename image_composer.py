@@ -211,9 +211,26 @@ def compose_news_card(
     card_rgb = card.convert("RGB")
     buffer = io.BytesIO()
     if output_format.upper() in ("JPG", "JPEG"):
-        card_rgb.save(buffer, format="JPEG", quality=95)
+        card_rgb.save(buffer, format="JPEG", quality=95, progressive=False)
     else:
         card_rgb.save(buffer, format="PNG", optimize=True)
 
     buffer.seek(0)
     return buffer.getvalue()
+
+
+def compose_news_card_jpeg(
+    image_source: Union[str, bytes],
+    headline: str,
+    brand_name: str = "Reetle",
+    language_label: str = "Spanish",
+) -> bytes:
+    """Convenience helper to compose a 1080x1350 news card directly as baseline JPEG for Instagram."""
+    return compose_news_card(
+        image_source=image_source,
+        headline=headline,
+        brand_name=brand_name,
+        language_label=language_label,
+        output_format="JPEG",
+    )
+

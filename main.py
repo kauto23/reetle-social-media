@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 import asyncio
 from tortoise import Tortoise
 from dotenv import load_dotenv
+import time
 import requests
 
-from image_composer import compose_news_card
+from image_composer import compose_news_card, compose_news_card_jpeg
 
 env = os.getenv('ENVIRONMENT', 'local')
 
@@ -71,31 +72,64 @@ def _fetch_secret(secret_id: str) -> str:
     return value
 
 
+def _resolve_page_access_token(token: str, page_id: str) -> str:
+    """If given a System User or User token, auto-resolves it to the Page Access Token."""
+    if not token or not page_id:
+        return token
+    try:
+        url = f"https://graph.facebook.com/v22.0/{page_id}"
+        resp = requests.get(
+            url,
+            params={"fields": "access_token", "access_token": token},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            resolved = data.get("access_token")
+            if resolved:
+                return resolved
+    except Exception as exc:
+        logger.warning("Could not auto-resolve Page Access Token: %s", exc)
+    return token
+
+
 def load_secrets():
+    DEFAULT_IG_ACCOUNT_ID = "17841425089520891"
+
     # Secret Manager (project lect-io) — confirm these exact resource names exist:
     #   - DATABASE_URL_PRODUCTION     (always, all environments)
     #   - FACEBOOK_PAGE_ID             (cloud only)
     #   - FACEBOOK_PAGE_ACCESS_TOKEN  (cloud only)
     #   - INTERNAL_API_KEY            (cloud only)
-    database_url = _fetch_secret("DATABASE_URL_PRODUCTION")
-
+    #   - INSTAGRAM_ACCOUNT_ID        (optional in GSM, defaults to 17841425089520891)
     if env == "cloud":
+        database_url = _fetch_secret("DATABASE_URL_PRODUCTION")
         # Secret Manager IDs must match names in GCP (SCREAMING_SNAKE_CASE).
         fb_page_id = _fetch_secret("FACEBOOK_PAGE_ID")
-        fb_access_token = _fetch_secret("FACEBOOK_PAGE_ACCESS_TOKEN")
+        raw_fb_token = _fetch_secret("FACEBOOK_PAGE_ACCESS_TOKEN")
+        fb_access_token = _resolve_page_access_token(raw_fb_token, fb_page_id)
         reetle_api_key = _fetch_secret("INTERNAL_API_KEY")
+        try:
+            ig_account_id = _fetch_secret("INSTAGRAM_ACCOUNT_ID")
+        except Exception:
+            ig_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID", DEFAULT_IG_ACCOUNT_ID)
+
         section("Startup — credentials (cloud)")
         logger.info("ENVIRONMENT=cloud | secrets=Secret Manager")
         logger.info("DATABASE_URL (masked)=%s", _mask_database_url(database_url))
         logger.info("FACEBOOK_PAGE_ID=%s", fb_page_id)
+        logger.info("INSTAGRAM_ACCOUNT_ID=%s", ig_account_id)
         logger.info("INTERNAL_API_KEY=%s", _redact_token(reetle_api_key))
         logger.info("FACEBOOK_PAGE_ACCESS_TOKEN=%s", _redact_token(fb_access_token, 12, 6))
         logger.info("REETLE_API_BASE_URL=%s", REETLE_API_BASE_URL)
     else:
         load_dotenv()
+        database_url = os.getenv("DATABASE_URL") or _fetch_secret("DATABASE_URL_PRODUCTION")
         fb_page_id = os.getenv("FACEBOOK_PAGE_ID")
-        fb_access_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+        raw_fb_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+        fb_access_token = _resolve_page_access_token(raw_fb_token, fb_page_id)
         reetle_api_key = os.getenv("INTERNAL_API_KEY")
+        ig_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID", DEFAULT_IG_ACCOUNT_ID)
 
         if not all([fb_page_id, fb_access_token, reetle_api_key]):
             raise ValueError(
@@ -104,9 +138,10 @@ def load_secrets():
             )
 
         section("Startup — credentials (local)")
-        logger.info("ENVIRONMENT=local | Facebook/API from .env | DB from Secret Manager")
+        logger.info("ENVIRONMENT=local | Facebook/API from .env | DB from .env / Secret Manager")
         logger.info("DATABASE_URL (masked)=%s", _mask_database_url(database_url))
         logger.info("FACEBOOK_PAGE_ID=%s", fb_page_id)
+        logger.info("INSTAGRAM_ACCOUNT_ID=%s", ig_account_id)
         logger.info("INTERNAL_API_KEY=%s", _redact_token(reetle_api_key or ""))
         logger.info("FACEBOOK_PAGE_ACCESS_TOKEN=%s", _redact_token(fb_access_token or "", 12, 6))
         logger.info("REETLE_API_BASE_URL=%s", REETLE_API_BASE_URL)
@@ -114,6 +149,7 @@ def load_secrets():
     return {
         'facebook_page_id': fb_page_id,
         'facebook_access_token': fb_access_token,
+        'instagram_account_id': ig_account_id,
         'reetle_internal_api_key': reetle_api_key,
         'database_url': database_url,
     }
@@ -156,7 +192,7 @@ JOIN articles a ON a.id = oa.article_id
 WHERE (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours'
   AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
   AND a.id NOT IN (
-      SELECT article_id FROM social_media_posts WHERE platform = 'facebook'
+      SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
   )
 ORDER BY oa.position
 LIMIT 1;
@@ -167,7 +203,7 @@ SELECTION_CRITERIA = (
     "Selection criteria (article must match all of the following):",
     "  • Latest article_display_orders row is newer than 3 hours",
     "  • Article metadata image_model.model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')",
-    "  • No social_media_posts row for this article with platform=facebook",
+    "  • No social_media_posts row for this article with platform IN ('facebook', 'instagram')",
     "  • Among matches, lowest display position wins (first in the order)",
 )
 
@@ -194,12 +230,16 @@ async def log_eligibility_diagnostics(conn) -> None:
     else:
         logger.warning("  → No rows in article_display_orders")
 
-    logger.info("── Facebook posts count ──")
+    logger.info("── Social media posts count ──")
     _, rows = await conn.execute_query(
-        "SELECT COUNT(*) AS cnt FROM social_media_posts WHERE platform = 'facebook';"
+        "SELECT platform, COUNT(*) AS cnt FROM social_media_posts "
+        "WHERE platform IN ('facebook', 'instagram') GROUP BY platform;"
     )
     if rows:
-        logger.info("  total facebook posts recorded=%s", rows[0]["cnt"])
+        for r in rows:
+            logger.info("  total %s posts recorded=%s", r["platform"], r["cnt"])
+    else:
+        logger.info("  no social media posts recorded yet for facebook or instagram")
 
     logger.info("── Top of current order (see Fresh / Posted / Model vs criteria) ──")
     _, rows = await conn.execute_query(
@@ -219,7 +259,7 @@ async def log_eligibility_diagnostics(conn) -> None:
                (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours' AS order_fresh,
                EXISTS (
                    SELECT 1 FROM social_media_posts s
-                   WHERE s.article_id = a.id AND s.platform = 'facebook'
+                   WHERE s.article_id = a.id AND s.platform IN ('facebook', 'instagram')
                ) AS already_posted
         FROM ordered_articles oa
         JOIN articles a ON a.id = oa.article_id
@@ -255,31 +295,142 @@ async def init_db():
     logger.info("[OK] Tortoise ORM initialised")
 
 
-CAPTIONS = [
+HOOKS = [
+    "Real news. Real Spanish. Written for your level.",
     "Improve your Spanish by reading today's real news, written for your level.",
     "Learn Spanish without flashcards. Just read the news.",
-    "Real news. Real Spanish. Written for your level.",
-    "Today's news in Spanish. Tap any word you don't know to see the translation.",
     "Spanish news you can actually understand, matched to your reading level.",
-    "Think Spanish news is too hard? Not when it's written for your level.",
-    "Read today's news in Spanish. Stuck on a word? Just tap it for the translation.",
+    "Today's news in Spanish, adapted to your reading level.",
     "Forget textbooks. Learn Spanish from stories the world is actually talking about.",
+    "Stay informed and build your Spanish at the same time.",
     "Your daily Spanish reading is ready. Today's real news, written for your level.",
     "Every article you read in Spanish makes the next one easier.",
-    "Read real Spanish news with built-in translations. No dictionary needed.",
-    "Not sure what a word means? Tap it. That's how you learn Spanish here.",
-    "Stay informed and learn Spanish at the same time. Real news, your level.",
-    "You don't need to understand every word. Tap the ones you don't and keep reading.",
-    "Spanish news with instant translations when you need them. Written for your level.",
+    "Read real Spanish news without getting stuck on difficult vocabulary.",
+    "Real journalism in Spanish, edited for language learners.",
+    "Understand Spanish news naturally, one story at a time.",
+    "Current affairs in Spanish, tailored to your reading level.",
+    "Improve your Spanish reading with today's top stories.",
+    "Real news in Spanish. Written for your level, not native fluency.",
 ]
 
 
-def build_caption(article_url: str) -> str:
-    section("Caption")
-    hook = random.choice(CAPTIONS)
-    caption = f"{hook}\n\n👉 Read story: {article_url}"
-    logger.info("Selected caption (%d chars):\n%s", len(caption), caption)
+def build_facebook_caption(article_url: str, hook: str | None = None) -> str:
+    section("Facebook — build caption")
+    if not hook:
+        hook = random.choice(HOOKS)
+    caption = f"{hook}\n\nRead the full story with instant translations: {article_url}"
+    logger.info("Selected Facebook caption (%d chars):\n%s", len(caption), caption)
     return caption
+
+
+def build_instagram_caption(hook: str | None = None) -> str:
+    section("Instagram — build caption")
+    if not hook:
+        hook = random.choice(HOOKS)
+    caption = f"{hook}\n\nTap the link in bio to read the full story with instant translations."
+    logger.info("Selected Instagram caption (%d chars):\n%s", len(caption), caption)
+    return caption
+
+
+def upload_card_to_gcs(jpeg_bytes: bytes, article_id: int) -> str:
+    """Uploads JPEG card to lect-io-articles GCS bucket and returns public HTTPS URL."""
+    section("GCS — upload card image")
+    from google.cloud import storage
+
+    client = storage.Client(project=GCP_PROJECT_ID)
+    bucket = client.bucket("lect-io-articles")
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    blob_name = f"images/social_cards/article_{article_id}_{timestamp}.jpeg"
+    blob = bucket.blob(blob_name)
+    logger.info("Uploading %d JPEG bytes to gs://lect-io-articles/%s", len(jpeg_bytes), blob_name)
+    blob.upload_from_string(jpeg_bytes, content_type="image/jpeg")
+    public_url = f"https://storage.googleapis.com/lect-io-articles/{blob_name}"
+    logger.info("[OK] Uploaded card to GCS: %s", public_url)
+    return public_url
+
+
+def publish_photo_to_instagram(image_url: str, caption: str) -> str:
+    """Publish a photo post to the Instagram Professional account via the 2-step Container API.
+
+    1. POST /{ig_user_id}/media?image_url={image_url}&caption={caption}
+    2. Wait for container status to be FINISHED (up to 30s)
+    3. POST /{ig_user_id}/media_publish?creation_id={container_id}
+    Returns the published Instagram media ID.
+    """
+    section("Instagram — publish photo post")
+    ig_user_id = secrets['instagram_account_id']
+    access_token = secrets['facebook_access_token']
+
+    # Step 1: Create Container
+    create_url = f"{GRAPH_API_BASE}/{ig_user_id}/media"
+    logger.info("Step 1: Creating IG media container | ig_user_id=%s", ig_user_id)
+    create_resp = requests.post(
+        create_url,
+        data={
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": access_token,
+        },
+        timeout=60,
+    )
+    logger.info("Instagram create container HTTP %s", create_resp.status_code)
+    try:
+        create_resp.raise_for_status()
+    except requests.HTTPError:
+        try:
+            logger.error("Instagram container error body: %s", create_resp.json())
+        except Exception:
+            logger.error("Instagram container error body (raw): %s", create_resp.text[:500])
+        raise
+
+    container_id = create_resp.json().get("id")
+    if not container_id:
+        raise RuntimeError(f"Instagram did not return a container id: {create_resp.text}")
+    logger.info("[OK] Instagram container created: id=%s", container_id)
+
+    # Step 2: Poll container status until ready
+    status_url = f"{GRAPH_API_BASE}/{container_id}"
+    for attempt in range(1, 7):
+        logger.info("Checking container status (attempt %d/6)...", attempt)
+        status_resp = requests.get(
+            status_url,
+            params={"fields": "status_code", "access_token": access_token},
+            timeout=30,
+        )
+        if status_resp.status_code == 200:
+            status_code = status_resp.json().get("status_code")
+            logger.info("Container %s status_code=%s", container_id, status_code)
+            if status_code == "FINISHED":
+                break
+            if status_code in ("ERROR", "EXPIRED"):
+                raise RuntimeError(f"Instagram media container failed with status: {status_code}")
+        time.sleep(2)
+
+    # Step 3: Publish Container
+    publish_url = f"{GRAPH_API_BASE}/{ig_user_id}/media_publish"
+    logger.info("Step 3: Publishing IG media container | creation_id=%s", container_id)
+    publish_resp = requests.post(
+        publish_url,
+        data={
+            "creation_id": container_id,
+            "access_token": access_token,
+        },
+        timeout=60,
+    )
+    logger.info("Instagram publish HTTP %s", publish_resp.status_code)
+    try:
+        publish_resp.raise_for_status()
+    except requests.HTTPError:
+        try:
+            logger.error("Instagram publish error body: %s", publish_resp.json())
+        except Exception:
+            logger.error("Instagram publish error body (raw): %s", publish_resp.text[:500])
+        raise
+
+    pub_data = publish_resp.json()
+    ig_post_id = pub_data.get("id")
+    logger.info("[OK] Instagram post published! id=%s", ig_post_id)
+    return ig_post_id
 
 
 def ensure_article_content(article_id: int) -> None:
@@ -367,28 +518,39 @@ def publish_photo_to_facebook(image_bytes: bytes, caption: str) -> str:
     return post_id
 
 
-async def record_post(article_id: int, post_id: str, caption: str, image_url: str):
+async def record_post(
+    article_id: int,
+    platform: str,
+    post_id: str,
+    caption: str,
+    image_url: str,
+    extra_meta: dict = None,
+):
     from reetle_models.models import SocialMediaPost
 
-    section("Database — record social_media_posts row")
+    section(f"Database — record social_media_posts row ({platform})")
     logger.info(
-        "Inserting platform=facebook article_id=%d post_id=%s",
+        "Inserting platform=%s article_id=%d post_id=%s",
+        platform,
         article_id,
         post_id,
     )
 
+    metadata = {
+        "caption": caption,
+        "image_url": image_url,
+        "posted_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra_meta:
+        metadata.update(extra_meta)
+
     await SocialMediaPost.create(
         article_id=article_id,
-        platform="facebook",
+        platform=platform,
         post_id=post_id,
-        metadata={
-            "page_id": secrets['facebook_page_id'],
-            "caption": caption,
-            "image_url": image_url,
-            "posted_at_utc": datetime.now(timezone.utc).isoformat(),
-        },
+        metadata=metadata,
     )
-    logger.info("[OK] Row saved for article_id=%d", article_id)
+    logger.info("[OK] Row saved for platform=%s article_id=%d", platform, article_id)
 
 
 async def run():
@@ -450,31 +612,58 @@ async def run():
 
     ensure_article_content(article_id)
 
-    section("Image — compose news card")
+    section("Image — compose news card (JPEG)")
     spanish_headline = headline_es or (headline.get("en") if isinstance(headline, dict) else "") or "Noticia de última hora"
     logger.info("Composing card with headline: %s", spanish_headline)
-    image_bytes = compose_news_card(
+    image_bytes = compose_news_card_jpeg(
         image_source=image_url,
         headline=spanish_headline,
     )
-    logger.info("[OK] Composed news card (%d bytes in memory)", len(image_bytes))
+    logger.info("[OK] Composed JPEG news card (%d bytes in memory)", len(image_bytes))
 
-    caption = build_caption(article_url)
-    post_id = publish_photo_to_facebook(image_bytes, caption)
+    # Upload to GCS so Instagram Meta crawler has public URL
+    gcs_card_url = upload_card_to_gcs(image_bytes, article_id)
 
-    await record_post(article_id, post_id, caption, image_url)
+    # Select editorial hook for this story
+    hook = random.choice(HOOKS)
+
+    # 1. Publish to Facebook
+    fb_caption = build_facebook_caption(article_url, hook=hook)
+    fb_post_id = publish_photo_to_facebook(image_bytes, fb_caption)
+    await record_post(
+        article_id=article_id,
+        platform="facebook",
+        post_id=fb_post_id,
+        caption=fb_caption,
+        image_url=gcs_card_url,
+        extra_meta={"page_id": secrets["facebook_page_id"]},
+    )
+
+    # 2. Publish to Instagram
+    ig_caption = build_instagram_caption(hook=hook)
+    ig_post_id = publish_photo_to_instagram(gcs_card_url, ig_caption)
+    await record_post(
+        article_id=article_id,
+        platform="instagram",
+        post_id=ig_post_id,
+        caption=ig_caption,
+        image_url=gcs_card_url,
+        extra_meta={"account_id": secrets["instagram_account_id"]},
+    )
+
     section("Result — success")
     logger.info(
-        "Posted article_id=%s to Facebook post_id=%s — recorded in DB.",
+        "Successfully posted article_id=%s to Facebook (post_id=%s) and Instagram (post_id=%s) — recorded in DB.",
         article_id,
-        post_id,
+        fb_post_id,
+        ig_post_id,
     )
 
 
 async def main():
     logger.info("")
     logger.info(
-        "Reetle Facebook job start | UTC=%s | ENVIRONMENT=%s",
+        "Reetle social media job start | UTC=%s | ENVIRONMENT=%s",
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         env,
     )

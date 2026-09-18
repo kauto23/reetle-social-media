@@ -10,7 +10,7 @@ Functionality for retrieving and interacting with articles. Articles are returne
 - **Guest article content:** 30 requests/minute (by IP)
 - **Get audio:** 120 requests/minute (relaxed)
 - **Generate audio:** 20 requests/minute (LLM-heavy, calls OpenAI TTS)
-- **Share (OG tags):** 60 requests/minute (by IP, public)
+- **Article OG metadata:** 60 requests/minute (by IP, public)
 
 See [Rate Limiting](./rate_limiting.md) for full details and how to handle 429 responses.
 
@@ -518,62 +518,55 @@ Audio generation uses a **dedicated OpenAI API key**, separate from the main key
 
 ---
 
-## Social Sharing (Open Graph)
+## Article OG Metadata
 
 ### Get Article OG Tags
-- **Endpoint:** `/share`
+- **Endpoint:** `/api/articles/{id}/og`
 - **Method:** `GET`
 - **Auth:** None — publicly accessible, no authentication required
 - **Rate Limit:** 60 requests/minute by IP
-- **Description:** Returns a minimal HTML page containing Open Graph meta tags for the given article. Intended for use by Facebook's scraper to generate preview cards when a reetle.co article link is shared. Real users who visit the URL are immediately redirected to the article on reetle.co via a `meta http-equiv="refresh"` tag; Facebook's scraper ignores the redirect and reads the OG tags instead.
+- **Description:** Returns Open Graph metadata (title and image) for a given article. Consumed by a Cloudflare Worker that intercepts social media crawlers and injects article-specific OG tags into the HTML response.
 
-#### Query Parameters
+#### Path Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `article` | Integer | Yes | The article ID |
+| `id` | Integer | Yes | The article ID |
 
 #### Example Request
 ```
-GET /share?article=42
+GET /api/articles/17003/og
 ```
 
 #### Response
 
-**Content-Type:** `text/html; charset=utf-8`
+**Content-Type:** `application/json`
 
 **200 OK:**
-```html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta property="og:title" content="El titular en español" />
-  <meta property="og:description" content="The English headline" />
-  <meta property="og:image" content="https://storage.googleapis.com/lect-io-articles/..." />
-  <meta property="og:url" content="https://reetle.co/share?article=42" />
-  <meta property="og:type" content="article" />
-  <meta http-equiv="refresh" content="0;url=https://reetle.co/?article=42" />
-</head>
-<body></body>
-</html>
+```json
+{
+  "title": "Tuchel convoca amplia plantilla de Inglaterra para pruebas mundialistas",
+  "image_url": "https://storage.googleapis.com/lect-io-articles/images/image_17003.jpeg"
+}
 ```
 
-| OG tag | Source |
-|--------|--------|
-| `og:title` | Spanish (`es`) headline; falls back to English if Spanish is absent |
-| `og:description` | English (`en`) headline |
-| `og:image` | `image_url` with `gs://lect-io-articles/` converted to `https://storage.googleapis.com/lect-io-articles/` |
-| `og:url` | `https://reetle.co/share?article={id}` |
-| `og:type` | `article` (static) |
+| Field | Description |
+|-------|-------------|
+| `title` | Article headline in Spanish. Falls back to English if no Spanish headline exists. |
+| `image_url` | Publicly accessible HTTPS URL to the article image. Empty string if no image exists. |
 
-**404 Not Found** (JSON):
+**404 Not Found:**
 ```json
 { "error": "Article not found" }
 ```
 
-**400 Bad Request** (JSON):
+**429 Rate Limited:**
 ```json
-{ "error": "article parameter is required" }
+{
+  "error": "Rate limit exceeded",
+  "detail": "Too many requests. Please try again in 45 seconds.",
+  "retry_after": 45
+}
 ```
 
 ---

@@ -25,3 +25,9 @@ env/
 .vscode/
 *.swp
 *.swo
+
+# OS
+.DS_Store
+
+# Ad creatives live in Ads Manager, not this repo
+fb_ads/
