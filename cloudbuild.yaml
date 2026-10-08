@@ -14,14 +14,21 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # 1) Build container with two tags (injecting GITHUB_TOKEN for private repo access)
+  # 1) Build container with two tags. The GitHub token for the private
+  #    reetle-models repo is passed as a BuildKit secret, so it is never stored
+  #    in the image or its history.
   - name: gcr.io/cloud-builders/docker
     entrypoint: bash
+    env: ['DOCKER_BUILDKIT=1']
     args:
       - '-c'
       - |
+        set -euo pipefail
+        TOKEN_FILE="$(mktemp)"
+        trap 'rm -f "$${TOKEN_FILE}"' EXIT
+        printf '%s' "$$GITHUB_TOKEN" > "$${TOKEN_FILE}"
         docker build \
-          --build-arg GITHUB_TOKEN=$$GITHUB_TOKEN \
+          --secret id=github_token,src="$${TOKEN_FILE}" \
           -t ${_AR_HOST}/${_PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA} \
           -t ${_AR_HOST}/${_PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest \
           .

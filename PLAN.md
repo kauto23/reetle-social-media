@@ -106,7 +106,7 @@ https://reetle.co/?article={id}
 
 **Deployment** — cloudbuild.yaml mirrors the parent:
 
-1. Docker build with `GITHUB_TOKEN` build arg (for `reetle-models` pip install)
+1. Docker build with `GITHUB_TOKEN` as a BuildKit secret, never a build arg (for `reetle-models` pip install)
 2. Push to `us-docker.pkg.dev/lect-io/lect-io-containers/reetle-facebook-poster`
 3. `gcloud run jobs update reetle-facebook-poster ...` (or `create` on first deploy)
 4. `gcloud run jobs execute reetle-facebook-poster`

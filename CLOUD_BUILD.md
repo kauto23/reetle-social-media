@@ -9,6 +9,9 @@ so IAM stays aligned (Artifact Registry, Cloud Run jobs, Secret Manager for `GIT
   `push-notification-service@lect-io.iam.gserviceaccount.com`  
   so each run uses that identity (same pattern as specifying it on the trigger).
 - **`options.logging: CLOUD_LOGGING_ONLY`** matches the requirement for user-specified build SAs.
+- **`GITHUB_TOKEN`** (Secret Manager) reaches `docker build` as a BuildKit secret
+  (`--secret id=github_token`, with `DOCKER_BUILDKIT=1`), never a `--build-arg`, so the token is
+  not stored in the image or its history.
 
 ## One-time: link the GitHub repo
 
