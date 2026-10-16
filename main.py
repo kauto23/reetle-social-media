@@ -190,6 +190,8 @@ SELECT oa.position, a.id, a.headline, a.image_url, a.metadata
 FROM ordered_articles oa
 JOIN articles a ON a.id = oa.article_id
 WHERE (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours'
+  -- Never the daily morning brief; it is not a news story.
+  AND a.kind = 'news'
   AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
   AND a.id NOT IN (
       SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
@@ -202,6 +204,7 @@ LIMIT 1;
 SELECTION_CRITERIA = (
     "Selection criteria (article must match all of the following):",
     "  • Latest article_display_orders row is newer than 3 hours",
+    "  • A news article (articles.kind = 'news'), never the morning brief",
     "  • Article metadata image_model.model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')",
     "  • No social_media_posts row for this article with platform IN ('facebook', 'instagram')",
     "  • Among matches, lowest display position wins (first in the order)",
