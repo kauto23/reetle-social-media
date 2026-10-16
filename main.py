@@ -200,6 +200,26 @@ ORDER BY oa.position
 LIMIT 1;
 """
 
+# reetle-articles starts this job with ARTICLE_ID set when an article reaches #1.
+# The same checks apply, except freshness and position: being the new #1 is the reason.
+ARTICLE_QUERY = """
+SELECT NULL::int AS position, a.id, a.headline, a.image_url, a.metadata
+FROM articles a
+WHERE a.id = $1
+  AND a.kind = 'news'
+  AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
+  AND a.id NOT IN (
+      SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
+  );
+"""
+
+ARTICLE_CRITERIA = (
+    "Article criteria (the given #1 article must match all of the following):",
+    "  • A news article (articles.kind = 'news'), never the morning brief",
+    "  • Article metadata image_model.model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')",
+    "  • No social_media_posts row for this article with platform IN ('facebook', 'instagram')",
+)
+
 # Logged before the selection query — matches rehearsal (why an article qualifies).
 SELECTION_CRITERIA = (
     "Selection criteria (article must match all of the following):",
@@ -561,17 +581,32 @@ async def run():
 
     section("Pipeline — select article")
     conn = Tortoise.get_connection("default")
-    for line in SELECTION_CRITERIA:
-        logger.info("%s", line)
-    logger.info("Executing selection query…")
-    _, rows = await conn.execute_query(SELECTION_QUERY)
+    requested_id = os.getenv("ARTICLE_ID")
+    if requested_id:
+        logger.info("ARTICLE_ID=%s — posting the new #1 article", requested_id)
+        for line in ARTICLE_CRITERIA:
+            logger.info("%s", line)
+        _, rows = await conn.execute_query(ARTICLE_QUERY, [int(requested_id)])
+        if not rows:
+            section("Result — no post")
+            logger.warning(
+                "Article %s does not match the criteria (already posted, not news, "
+                "or an image model we do not post).", requested_id,
+            )
+            logger.info("Exit 0 — nothing to do.")
+            return
+    else:
+        for line in SELECTION_CRITERIA:
+            logger.info("%s", line)
+        logger.info("Executing selection query…")
+        _, rows = await conn.execute_query(SELECTION_QUERY)
 
-    if not rows:
-        section("Result — no post")
-        logger.warning("Query returned 0 rows — no article matched all criteria.")
-        await log_eligibility_diagnostics(conn)
-        logger.info("Exit 0 — nothing to do.")
-        return
+        if not rows:
+            section("Result — no post")
+            logger.warning("Query returned 0 rows — no article matched all criteria.")
+            await log_eligibility_diagnostics(conn)
+            logger.info("Exit 0 — nothing to do.")
+            return
 
     row = rows[0]
     article_id = row["id"]
@@ -593,10 +628,13 @@ async def run():
         else "[metadata not a dict]"
     )
 
-    logger.info(
-        "[OK] Eligible article — chosen because it is the first slot in the "
-        "current order that passes freshness, image model, and not-already-posted filters."
-    )
+    if requested_id:
+        logger.info("[OK] Eligible article — the new #1, not posted before.")
+    else:
+        logger.info(
+            "[OK] Eligible article — chosen because it is the first slot in the "
+            "current order that passes freshness, image model, and not-already-posted filters."
+        )
     logger.info("  article_id       : %s", article_id)
     logger.info("  display_position : %s", position)
     logger.info(
