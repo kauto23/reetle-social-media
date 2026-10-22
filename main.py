@@ -192,6 +192,8 @@ JOIN articles a ON a.id = oa.article_id
 WHERE (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours'
   -- Never the daily morning brief; it is not a news story.
   AND a.kind = 'news'
+  -- Never a live blog: reetle.co and older apps do not show them.
+  AND a.metadata -> 'live' IS NULL
   AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
   AND a.id NOT IN (
       SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
@@ -207,6 +209,8 @@ SELECT NULL::int AS position, a.id, a.headline, a.image_url, a.metadata
 FROM articles a
 WHERE a.id = $1
   AND a.kind = 'news'
+  -- Never a live blog: reetle.co and older apps do not show them.
+  AND a.metadata -> 'live' IS NULL
   AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
   AND a.id NOT IN (
       SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
@@ -216,6 +220,7 @@ WHERE a.id = $1
 ARTICLE_CRITERIA = (
     "Article criteria (the given #1 article must match all of the following):",
     "  • A news article (articles.kind = 'news'), never the morning brief",
+    "  • Not a live blog (articles.metadata has no 'live')",
     "  • Article metadata image_model.model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')",
     "  • No social_media_posts row for this article with platform IN ('facebook', 'instagram')",
 )
@@ -225,6 +230,7 @@ SELECTION_CRITERIA = (
     "Selection criteria (article must match all of the following):",
     "  • Latest article_display_orders row is newer than 3 hours",
     "  • A news article (articles.kind = 'news'), never the morning brief",
+    "  • Not a live blog (articles.metadata has no 'live')",
     "  • Article metadata image_model.model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')",
     "  • No social_media_posts row for this article with platform IN ('facebook', 'instagram')",
     "  • Among matches, lowest display position wins (first in the order)",
