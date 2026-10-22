@@ -85,6 +85,8 @@ JOIN articles a ON a.id = oa.article_id
 WHERE (SELECT created_at FROM latest_order) > NOW() - INTERVAL '3 hours'
   -- Never the daily morning brief; it is not a news story.
   AND a.kind = 'news'
+  -- Never a live blog: reetle.co and older apps do not show them.
+  AND a.metadata -> 'live' IS NULL
   AND a.metadata->'image_model'->>'model' IN ('gemini-3.1-flash-image', 'gpt-image-1.5')
   AND a.id NOT IN (
       SELECT article_id FROM social_media_posts WHERE platform IN ('facebook', 'instagram')
@@ -316,6 +318,7 @@ async def select_article() -> dict | None:
     info("Selection criteria:")
     info("  • Latest article_display_orders entry must be < 3 hours old")
     info("  • Must be a news article (articles.kind = 'news'), never the morning brief")
+    info("  • Must not be a live blog (articles.metadata has no 'live')")
     info("  • Article image model IN ('gemini-3.1-flash-image', 'gpt-image-1.5')")
     info("  • Article must not already have a post recorded on Facebook or Instagram")
     info("  • First article by display position is chosen")
